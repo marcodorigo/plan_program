@@ -28,7 +28,7 @@ public:
     // Publisher for the planned path
     path_publisher_ = this->create_publisher<moveit_msgs::msg::RobotTrajectory>("/moveit_path", 10);
 
-    // Timer for planning every second
+    // Timer for planning every five seconds
     timer_ = this->create_wall_timer(
       std::chrono::seconds(1),
       std::bind(&PlanNode::timer_callback, this));
@@ -157,10 +157,12 @@ private:
 
     is_planning_ = true;
 
-    // Set planning time to be less than timer interval to avoid conflicts
-    move_group_interface_->setPlanningTime(2.0);  // Increase from 0.8s to 2s
-    move_group_interface_->setNumPlanningAttempts(3);  // Fewer attempts for faster planning
-
+    // Set planning parameters
+    move_group_interface_->setPlanningTime(5.0);  // Increase planning time
+    move_group_interface_->setNumPlanningAttempts(5);
+    move_group_interface_->setPlannerId("RRTConnect");  // Try specific planner
+    move_group_interface_->allowReplanning(true);
+    
     // Convert Float32MultiArray to Pose with fixed orientation
     geometry_msgs::msg::Pose target_pose;
     target_pose.position.x = latest_target_position_.data[0];
@@ -175,8 +177,8 @@ private:
 
     move_group_interface_->setPoseTarget(target_pose);
 
-    RCLCPP_INFO(this->get_logger(), "Planning to position: [%.3f, %.3f, %.3f] with fixed orientation: [1.0, 0.0, 0.0, 0.0]",
-                target_pose.position.x, target_pose.position.y, target_pose.position.z);
+    // RCLCPP_INFO(this->get_logger(), "Planning to position: [%.3f, %.3f, %.3f] with fixed orientation: [1.0, 0.0, 0.0, 0.0]",
+    //             target_pose.position.x, target_pose.position.y, target_pose.position.z);
 
     // Set up orientation constraints
     moveit_msgs::msg::OrientationConstraint orientation_constraint;
@@ -201,32 +203,25 @@ private:
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     auto planning_result = move_group_interface_->plan(plan);
     
-    RCLCPP_INFO(this->get_logger(), "Planning result: %d", planning_result.val);
+    
+    // RCLCPP_INFO(this->get_logger(), "Planning result: %d", planning_result.val);
     bool has_trajectory = !plan.trajectory_.joint_trajectory.points.empty();
-    RCLCPP_INFO(this->get_logger(), "Trajectory has %zu points", plan.trajectory_.joint_trajectory.points.size());
+    // RCLCPP_INFO(this->get_logger(), "Trajectory has %zu points", plan.trajectory_.joint_trajectory.points.size());
 
+    path_publisher_->publish(plan.trajectory_);
+    RCLCPP_INFO(this->get_logger(), "Published path with %zu waypoints to /moveit_path", 
+                  plan.trajectory_.joint_trajectory.points.size());
+    
     // Publish if we have a valid trajectory
     if (planning_result == moveit::core::MoveItErrorCode::SUCCESS || has_trajectory) {
       RCLCPP_INFO(this->get_logger(), "Planning successful or trajectory available!");
       
       // Publish the planned trajectory
       path_publisher_->publish(plan.trajectory_);
-      RCLCPP_INFO(this->get_logger(), "Published path with %zu waypoints to /moveit_path", 
-                  plan.trajectory_.joint_trajectory.points.size());
+      // RCLCPP_INFO(this->get_logger(), "Published path with %zu waypoints to /moveit_path", 
+      //             plan.trajectory_.joint_trajectory.points.size());
       
-      // Log first few waypoints for debugging
-      if (!plan.trajectory_.joint_trajectory.points.empty()) {
-        const auto& first_point = plan.trajectory_.joint_trajectory.points[0];
-        const auto& last_point = plan.trajectory_.joint_trajectory.points.back();
-        RCLCPP_INFO(this->get_logger(), "First waypoint: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
-                    first_point.positions[0], first_point.positions[1], first_point.positions[2],
-                    first_point.positions[3], first_point.positions[4], first_point.positions[5]);
-        RCLCPP_INFO(this->get_logger(), "Last waypoint: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
-                    last_point.positions[0], last_point.positions[1], last_point.positions[2],
-                    last_point.positions[3], last_point.positions[4], last_point.positions[5]);
-      }
-      
-      RCLCPP_INFO(this->get_logger(), "Plan ready for execution (execution disabled to avoid segfault)");
+      // RCLCPP_INFO(this->get_logger(), "Plan ready for execution (execution disabled to avoid segfault)");
     } else {
       RCLCPP_WARN(this->get_logger(), "Planning failed! Error code: %d", planning_result.val);
     }
