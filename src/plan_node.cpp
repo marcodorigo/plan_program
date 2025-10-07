@@ -181,7 +181,6 @@ private:
     //             target_pose.position.x, target_pose.position.y, target_pose.position.z);
 
 
-    // PROVA
     // Set up orientation constraints
     moveit_msgs::msg::OrientationConstraint orientation_constraint;
     orientation_constraint.link_name = "tool0";
