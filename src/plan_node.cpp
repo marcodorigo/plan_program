@@ -180,6 +180,8 @@ private:
     // RCLCPP_INFO(this->get_logger(), "Planning to position: [%.3f, %.3f, %.3f] with fixed orientation: [1.0, 0.0, 0.0, 0.0]",
     //             target_pose.position.x, target_pose.position.y, target_pose.position.z);
 
+
+    // PROVA
     // Set up orientation constraints
     moveit_msgs::msg::OrientationConstraint orientation_constraint;
     orientation_constraint.link_name = "tool0";
