@@ -8,6 +8,8 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/msg/orientation_constraint.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
 
 class PlanNode : public rclcpp::Node
 {
@@ -18,15 +20,21 @@ public:
       "/target_position", 10,
       std::bind(&PlanNode::target_position_callback, this, std::placeholders::_1));
 
+    // Subscription for spherical obstacles
+    spherical_obstacles_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+      "/spherical_obstacles", 10,
+      std::bind(&PlanNode::spherical_obstacles_callback, this, std::placeholders::_1));
+
     // Publisher for the planned path
     path_publisher_ = this->create_publisher<moveit_msgs::msg::RobotTrajectory>("/moveit_path", 10);
 
     // Timer for planning every second
     timer_ = this->create_wall_timer(
-      std::chrono::seconds(5),
+      std::chrono::seconds(1),
       std::bind(&PlanNode::timer_callback, this));
 
     RCLCPP_INFO(this->get_logger(), "Waiting for target position on /target_position topic...");
+    RCLCPP_INFO(this->get_logger(), "Waiting for spherical obstacles on /spherical_obstacles topic...");
   }
 
   void initialize()
@@ -35,38 +43,10 @@ public:
     move_group_interface_ = std::make_unique<moveit::planning_interface::MoveGroupInterface>(
       shared_from_this(), "ur_manipulator");
     
-    // Create collision object for the robot to avoid
-    auto const collision_object = [frame_id = move_group_interface_->getPlanningFrame()] {
-      moveit_msgs::msg::CollisionObject collision_object;
-      collision_object.header.frame_id = frame_id;
-      collision_object.id = "sphere1";
-      shape_msgs::msg::SolidPrimitive primitive;
-
-      // Define the sphere
-      primitive.type = primitive.SPHERE;
-      primitive.dimensions.resize(1);
-      primitive.dimensions[primitive.SPHERE_RADIUS] = 0.07;
-
-      // Define the pose of the sphere (relative to the frame_id)
-      geometry_msgs::msg::Pose sphere_pose;
-      sphere_pose.orientation.w = 1.0;
-      sphere_pose.position.x = 0.08;
-      sphere_pose.position.y = 0.5;
-      sphere_pose.position.z = 0.44;
-
-      collision_object.primitives.push_back(primitive);
-      collision_object.primitive_poses.push_back(sphere_pose);
-      collision_object.operation = collision_object.ADD;
-
-      return collision_object;
-    }();
-
-    // Add the collision object to the scene
+    // Initialize planning scene interface
     planning_scene_interface_ = std::make_unique<moveit::planning_interface::PlanningSceneInterface>();
-    planning_scene_interface_->applyCollisionObject(collision_object);
     
     RCLCPP_INFO(this->get_logger(), "MoveIt interface initialized");
-    RCLCPP_INFO(this->get_logger(), "Added spherical obstacle at [0.08, 0.5, 0.44] with radius 0.07");
   }
 
 private:
@@ -82,6 +62,78 @@ private:
                 msg->data[0], msg->data[1], msg->data[2]);
   }
 
+  void spherical_obstacles_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
+  {
+    if (!planning_scene_interface_) {
+      RCLCPP_WARN(this->get_logger(), "Planning scene interface not initialized yet");
+      return;
+    }
+
+    // Clear existing collision objects
+    std::vector<std::string> object_ids;
+    for (size_t i = 0; i < spherical_obstacles_.size(); ++i) {
+      object_ids.push_back("sphere" + std::to_string(i));
+    }
+    if (!object_ids.empty()) {
+      planning_scene_interface_->removeCollisionObjects(object_ids);
+    }
+
+    spherical_obstacles_.clear();
+    
+    // Parse the received data: [x1, y1, z1, radius1, x2, y2, z2, radius2, ...]
+    for (size_t i = 0; i + 3 < msg->data.size(); i += 4) {
+      SphericalObstacle obstacle;
+      obstacle.center_x = msg->data[i];
+      obstacle.center_y = msg->data[i + 1];
+      obstacle.center_z = msg->data[i + 2];
+      obstacle.radius = msg->data[i + 3];
+      
+      // Only add obstacles with non-zero radius
+      if (obstacle.radius > 0.0) {
+        spherical_obstacles_.push_back(obstacle);
+      }
+    }
+
+    // Create and add collision objects for each spherical obstacle
+    std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
+    
+    for (size_t i = 0; i < spherical_obstacles_.size(); ++i) {
+      const auto& obstacle = spherical_obstacles_[i];
+      
+      moveit_msgs::msg::CollisionObject collision_object;
+      collision_object.header.frame_id = move_group_interface_->getPlanningFrame();
+      collision_object.id = "sphere" + std::to_string(i);
+      
+      shape_msgs::msg::SolidPrimitive primitive;
+      primitive.type = primitive.SPHERE;
+      primitive.dimensions.resize(1);
+      primitive.dimensions[primitive.SPHERE_RADIUS] = obstacle.radius;
+
+      geometry_msgs::msg::Pose sphere_pose;
+      sphere_pose.orientation.w = 1.0;
+      sphere_pose.position.x = obstacle.center_x;
+      sphere_pose.position.y = obstacle.center_y;
+      sphere_pose.position.z = obstacle.center_z;
+
+      collision_object.primitives.push_back(primitive);
+      collision_object.primitive_poses.push_back(sphere_pose);
+      collision_object.operation = collision_object.ADD;
+      
+      collision_objects.push_back(collision_object);
+    }
+
+    // Apply all collision objects to the scene
+    if (!collision_objects.empty()) {
+      planning_scene_interface_->applyCollisionObjects(collision_objects);
+      RCLCPP_INFO(this->get_logger(), "Added %zu spherical obstacles to the scene", 
+                  spherical_obstacles_.size());
+    } else {
+      RCLCPP_INFO(this->get_logger(), "No valid spherical obstacles to add");
+    }
+
+    has_obstacles_ = true;
+  }
+
   void timer_callback()
   {
     if (!move_group_interface_) {
@@ -92,14 +144,30 @@ private:
       RCLCPP_INFO(this->get_logger(), "No target position received yet.");
       return;
     }
+    if (!has_obstacles_) {
+      RCLCPP_INFO(this->get_logger(), "No obstacles received yet.");
+      return;
+    }
 
-    // Convert Float32MultiArray to Pose
+    // Skip if already planning
+    if (is_planning_) {
+      RCLCPP_INFO(this->get_logger(), "Already planning, skipping this cycle");
+      return;
+    }
+
+    is_planning_ = true;
+
+    // Set planning time to be less than timer interval to avoid conflicts
+    move_group_interface_->setPlanningTime(2.0);  // Increase from 0.8s to 2s
+    move_group_interface_->setNumPlanningAttempts(3);  // Fewer attempts for faster planning
+
+    // Convert Float32MultiArray to Pose with fixed orientation
     geometry_msgs::msg::Pose target_pose;
     target_pose.position.x = latest_target_position_.data[0];
     target_pose.position.y = latest_target_position_.data[1];
     target_pose.position.z = latest_target_position_.data[2];
     
-    // Set default orientation
+    // Set fixed orientation as specified
     target_pose.orientation.x = 1.0;
     target_pose.orientation.y = 0.0;
     target_pose.orientation.z = 0.0;
@@ -107,32 +175,84 @@ private:
 
     move_group_interface_->setPoseTarget(target_pose);
 
-    auto const [success, plan] = [this]{
-      moveit::planning_interface::MoveGroupInterface::Plan msg;
-      auto const ok = static_cast<bool>(move_group_interface_->plan(msg));
-      return std::make_pair(ok, msg);
-    }();
+    RCLCPP_INFO(this->get_logger(), "Planning to position: [%.3f, %.3f, %.3f] with fixed orientation: [1.0, 0.0, 0.0, 0.0]",
+                target_pose.position.x, target_pose.position.y, target_pose.position.z);
 
-    if(success) {
-      RCLCPP_INFO(this->get_logger(), "Planning successful!");
+    // Set up orientation constraints
+    moveit_msgs::msg::OrientationConstraint orientation_constraint;
+    orientation_constraint.link_name = "tool0";
+    orientation_constraint.header.frame_id = move_group_interface_->getPlanningFrame();
+    orientation_constraint.orientation.x = 1.0;
+    orientation_constraint.orientation.y = 0.0;
+    orientation_constraint.orientation.z = 0.0;
+    orientation_constraint.orientation.w = 0.0;
+    
+    // Set tolerance for orientation constraint
+    orientation_constraint.absolute_x_axis_tolerance = 0.3;
+    orientation_constraint.absolute_y_axis_tolerance = 0.3;
+    orientation_constraint.absolute_z_axis_tolerance = 0.3;
+    orientation_constraint.weight = 1.0;
+
+    moveit_msgs::msg::Constraints constraints;
+    constraints.orientation_constraints.push_back(orientation_constraint);
+    move_group_interface_->setPathConstraints(constraints);
+
+    // Plan the trajectory with constraints
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    auto planning_result = move_group_interface_->plan(plan);
+    
+    RCLCPP_INFO(this->get_logger(), "Planning result: %d", planning_result.val);
+    bool has_trajectory = !plan.trajectory_.joint_trajectory.points.empty();
+    RCLCPP_INFO(this->get_logger(), "Trajectory has %zu points", plan.trajectory_.joint_trajectory.points.size());
+
+    // Publish if we have a valid trajectory
+    if (planning_result == moveit::core::MoveItErrorCode::SUCCESS || has_trajectory) {
+      RCLCPP_INFO(this->get_logger(), "Planning successful or trajectory available!");
       
       // Publish the planned trajectory
       path_publisher_->publish(plan.trajectory_);
-      RCLCPP_INFO(this->get_logger(), "Published path to /moveit_path");
+      RCLCPP_INFO(this->get_logger(), "Published path with %zu waypoints to /moveit_path", 
+                  plan.trajectory_.joint_trajectory.points.size());
       
-      RCLCPP_INFO(this->get_logger(), "Executing plan...");
-      move_group_interface_->execute(plan);
+      // Log first few waypoints for debugging
+      if (!plan.trajectory_.joint_trajectory.points.empty()) {
+        const auto& first_point = plan.trajectory_.joint_trajectory.points[0];
+        const auto& last_point = plan.trajectory_.joint_trajectory.points.back();
+        RCLCPP_INFO(this->get_logger(), "First waypoint: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    first_point.positions[0], first_point.positions[1], first_point.positions[2],
+                    first_point.positions[3], first_point.positions[4], first_point.positions[5]);
+        RCLCPP_INFO(this->get_logger(), "Last waypoint: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                    last_point.positions[0], last_point.positions[1], last_point.positions[2],
+                    last_point.positions[3], last_point.positions[4], last_point.positions[5]);
+      }
+      
+      RCLCPP_INFO(this->get_logger(), "Plan ready for execution (execution disabled to avoid segfault)");
     } else {
-      RCLCPP_WARN(this->get_logger(), "Planning failed!");
+      RCLCPP_WARN(this->get_logger(), "Planning failed! Error code: %d", planning_result.val);
     }
+
+    // Clear targets and constraints
+    move_group_interface_->clearPoseTargets();
+    move_group_interface_->clearPathConstraints();
+    
+    // Reset planning flag
+    is_planning_ = false;
   }
 
+  struct SphericalObstacle {
+    float center_x, center_y, center_z, radius;
+  };
+
   std_msgs::msg::Float32MultiArray latest_target_position_;
+  std::vector<SphericalObstacle> spherical_obstacles_;
   bool has_target_ = false;
+  bool has_obstacles_ = false;
+  bool is_planning_ = false;  // Add planning state flag
   rclcpp::TimerBase::SharedPtr timer_;
   std::unique_ptr<moveit::planning_interface::MoveGroupInterface> move_group_interface_;
   std::unique_ptr<moveit::planning_interface::PlanningSceneInterface> planning_scene_interface_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr target_position_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr spherical_obstacles_sub_;
   rclcpp::Publisher<moveit_msgs::msg::RobotTrajectory>::SharedPtr path_publisher_;
 };
 

@@ -59,8 +59,20 @@ def generate_launch_description():
             {"robot_description_semantic": custom_srdf_content},
             {"robot_description_kinematics": kinematics_content},
         ]
-    )
+    ),
+
+    # Path converter node - converts joint trajectories to Cartesian paths
+    Node(
+        package='plan_program',
+        executable='path_converter_node',
+        name='path_converter_node',
+        output='screen',
+        parameters=[
+            # Add any parameters here if needed
+        ]
+    ),
 
     return LaunchDescription([
-        plan_node
+        plan_node,
+        path_converter_node
     ])
